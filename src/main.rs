@@ -5,10 +5,12 @@ use dns_message_parser::{Dns, Flags, Opcode, RCode};
 use regex::Regex;
 use std::fmt::{Debug, Display};
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+use std::io::Read;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::str::FromStr;
 
 const BUF_SIZE: usize = 1024;
+const AUTO_BIND_ADDR: &str = "0.0.0.0:0";
 
 type Table = Vec<(IpAddr, String)>;
 type Error = Box<dyn std::error::Error>;
@@ -118,12 +120,36 @@ fn handle_request(input: Vec<u8>, table: &Table) -> Option<Vec<u8>> {
     };
 }
 
+fn forward_to_resolver(addr: SocketAddr, packet_buf: &[u8]) -> Result<Vec<u8>, Error> {
+    println!("\tRequesting default resolver: {:?}", addr);
+
+    let mut buf = [0u8; BUF_SIZE];
+
+    let sock = UdpSocket::bind(AUTO_BIND_ADDR).unwrap();
+    let _ = sock.send_to(packet_buf, addr);
+    let (size, addr_recv) = sock.recv_from(&mut buf)?;
+    let buf = &buf[..size];
+
+    println!("\t\tGot from: {:}", addr_recv);
+
+    let buf_bytes = Bytes::from(buf.to_vec());
+    let packet = Dns::decode(buf_bytes).unwrap();
+    println!("\t\tPacket: {:}", packet);
+
+    return if addr_recv == addr {
+        Ok(buf.to_vec())
+    } else {
+        Err(Error::from(format!("send & recv addrs mismatch: {:} - {:}", addr_recv, addr)))
+    }
+}
+
 fn main() {
     let host = IpAddr::V4(Ipv4Addr::from_str("127.0.0.1").unwrap());
     let port = 3333;
 
-    let addr = format!("{}:{}", host, port);
+    let default_resolver: SocketAddr = SocketAddr::V4(SocketAddrV4::from_str("9.9.9.9:53").unwrap());
 
+    let addr = SocketAddr::new(host, port);
     println!("=== ADDR: {} ===", addr);
 
     let hosts_table = read_table("./hosts.txt").unwrap();
@@ -135,8 +161,15 @@ fn main() {
         let mut buf = [0u8; BUF_SIZE];
         let (size, addr) = udp_socket.recv_from(&mut buf).unwrap();
 
-        let buf_slice = &buf[0..size];
-        let reply = handle_request(buf_slice.to_vec(), &hosts_table);
+        let buf = &buf[0..size];
+        let reply = match handle_request(buf.to_vec(), &hosts_table) {
+            Some(val) => val,
+            None =>
+                forward_to_resolver(
+                    default_resolver,
+                    buf
+                ).unwrap()
+        };
         udp_socket.send_to(reply.as_slice(), addr).unwrap();
     }
 }
